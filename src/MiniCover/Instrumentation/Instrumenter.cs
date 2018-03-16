@@ -24,7 +24,7 @@ namespace MiniCover.Instrumentation
         private readonly Type hitServiceType = typeof(HitService);
         private readonly Type methodContextType = typeof(HitService.MethodContext);
         private readonly IEnumerable<string> instrumentationDependencies;
-        
+
         private readonly ConstructorInfo instrumentedAttributeConstructor = typeof(InstrumentedAttribute).GetConstructors().First();
 
         private InstrumentationResult result;
@@ -199,6 +199,7 @@ namespace MiniCover.Instrumentation
 
                         var ilProcessor = methodDefinition.Body.GetILProcessor();
 
+                        ilProcessor.Body.InitLocals = true;
                         ilProcessor.Body.SimplifyMacros();
 
                         var instructions = methodDefinition.Body.Instructions.ToDictionary(i => i.Offset);
@@ -211,19 +212,24 @@ namespace MiniCover.Instrumentation
                         ilProcessor.InsertBefore(instructions[0], storeMethodResultInstruction);
                         ilProcessor.InsertBefore(storeMethodResultInstruction, enterMethodInstruction);
                         ilProcessor.InsertBefore(enterMethodInstruction, pathParamLoadInstruction);
-                        UpdateInstructionReferences(methodDefinition, instructions[0], pathParamLoadInstruction);
+                        ReplaceInstructionReferences(methodDefinition, instructions[0], pathParamLoadInstruction);
 
-                        foreach (var instruction in instructions.Values)
+                        var (returnStart, returnEnd) = FixReturns(assemblyDefinition, methodDefinition, ilProcessor);
+
+                        var loadMethodContextInstruction = ilProcessor.Create(OpCodes.Ldloc, methodContextVariable);
+                        var exitMethodInstruction = ilProcessor.Create(OpCodes.Callvirt, exitMethodReference);
+                        ilProcessor.InsertBefore(returnStart, exitMethodInstruction);
+                        ilProcessor.InsertBefore(exitMethodInstruction, loadMethodContextInstruction);
+                        ReplaceInstructionReferences(methodDefinition, returnStart, loadMethodContextInstruction);
+
+                        /*var handler = new ExceptionHandler(ExceptionHandlerType.Finally)
                         {
-                            if (instruction.OpCode == OpCodes.Ret)
-                            {
-                                var loadMethodContextInstruction = ilProcessor.Create(OpCodes.Ldloc, methodContextVariable);
-                                var exitMethodInstruction = ilProcessor.Create(OpCodes.Callvirt, exitMethodReference);
-                                ilProcessor.InsertBefore(instruction, exitMethodInstruction);
-                                ilProcessor.InsertBefore(exitMethodInstruction, loadMethodContextInstruction);
-                                UpdateInstructionReferences(methodDefinition, instruction, loadMethodContextInstruction);
-                            }
-                        }
+                            TryStart = pathParamLoadInstruction,
+                            TryEnd = loadMethodContextInstruction,
+                            HandlerStart = loadMethodContextInstruction,
+                            HandlerEnd = returnEnd,
+                        };
+                        ilProcessor.Body.ExceptionHandlers.Add(handler);*/
 
                         foreach (var sequencePoint in methodGroup)
                         {
@@ -274,6 +280,69 @@ namespace MiniCover.Instrumentation
             }
         }
 
+        private (Instruction returnStart, Instruction returnEnd) FixReturns(
+            AssemblyDefinition assemblyDefinition,
+            MethodDefinition methodDefinition,
+            ILProcessor ilProcessor)
+        {
+            if (methodDefinition.ReturnType == assemblyDefinition.MainModule.TypeSystem.Void)
+            {
+                var instructions = ilProcessor.Body.Instructions.ToArray();
+
+                var newReturnInstruction = ilProcessor.Create(OpCodes.Ret);
+                ilProcessor.Append(newReturnInstruction);
+
+                foreach (var instruction in instructions)
+                {
+                    if (instruction.OpCode == OpCodes.Ret)
+                    {
+                        var leaveInstruction = ilProcessor.Create(OpCodes.Leave, newReturnInstruction);
+                        ilProcessor.Replace(instruction, leaveInstruction);
+
+                        ReplaceInstructionReferences(methodDefinition, instruction, leaveInstruction);
+                    }
+                }
+
+                return (newReturnInstruction, newReturnInstruction);
+            }
+            else
+            {
+                var instructions = ilProcessor.Body.Instructions.ToArray();
+
+                var returnVariable = new VariableDefinition(methodDefinition.ReturnType);
+                ilProcessor.Body.Variables.Add(returnVariable);
+
+                var loadResultInstruction = ilProcessor.Create(OpCodes.Ldloc, returnVariable);
+                ilProcessor.Append(loadResultInstruction);
+                var newReturnInstruction = ilProcessor.Create(OpCodes.Ret);
+                ilProcessor.Append(newReturnInstruction);
+
+                foreach (var instruction in instructions)
+                {
+                    if (instruction.OpCode == OpCodes.Ret)
+                    {
+                        var saveResultInstruction = ilProcessor.Create(OpCodes.Stloc, returnVariable);
+                        ilProcessor.Replace(instruction, saveResultInstruction);
+                        var leaveInstruction = ilProcessor.Create(OpCodes.Leave, loadResultInstruction);
+                        ilProcessor.InsertAfter(saveResultInstruction, leaveInstruction);
+
+                        ReplaceInstructionReferences(methodDefinition, instruction, leaveInstruction);
+                    }
+                }
+
+                return (loadResultInstruction, newReturnInstruction);
+            }
+        }
+
+        private Instruction FirstInstructionSkipCtor(MethodDefinition method, ILProcessor ilProcessor)
+        {
+            if (method.IsConstructor && !method.IsStatic)
+            {
+                return ilProcessor.Body.Instructions.Skip(2).First();
+            }
+            return ilProcessor.Body.Instructions.First();
+        }
+
         private bool HasSourceFiles(AssemblyDefinition assemblyDefinition)
         {
             return assemblyDefinition
@@ -302,7 +371,7 @@ namespace MiniCover.Instrumentation
                 File.Delete(pdbBackupFile);
             }
         }
-        
+
         private void InstrumentInstruction(int instructionId, Instruction instruction,
             MethodReference hitInstructionReference, MethodDefinition method, ILProcessor ilProcessor,
             VariableDefinition methodContextVariable)
@@ -315,10 +384,10 @@ namespace MiniCover.Instrumentation
             ilProcessor.InsertBefore(registerInstruction, lineParamLoadInstruction);
             ilProcessor.InsertBefore(lineParamLoadInstruction, loadMethodContextInstruction);
 
-            UpdateInstructionReferences(method, instruction, loadMethodContextInstruction);
+            ReplaceInstructionReferences(method, instruction, loadMethodContextInstruction);
         }
 
-        private static void UpdateInstructionReferences(MethodDefinition methodDefinition,
+        private static void ReplaceInstructionReferences(MethodDefinition methodDefinition,
             Instruction oldInstruction,
             Instruction newInstruction)
         {

@@ -16,6 +16,8 @@ namespace MiniCover.NUnit.Tests
             var b = 2;
             var c = a + b;
 
+            throw new Exception("Test");
+
             Assert.AreEqual(a, b);
             Assert.AreEqual(4, c);
 
