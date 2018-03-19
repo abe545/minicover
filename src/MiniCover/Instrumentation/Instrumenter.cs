@@ -12,6 +12,7 @@ using System.Reflection;
 using MiniCover.HitServices;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
+using System.Diagnostics;
 
 namespace MiniCover.Instrumentation
 {
@@ -24,7 +25,7 @@ namespace MiniCover.Instrumentation
         private readonly string normalizedWorkDir;
         private readonly Type hitServiceType = typeof(HitService);
         private readonly Type methodContextType = typeof(HitService.MethodContext);
-        private readonly IEnumerable<string> instrumentationDependencies;
+        private readonly Assembly hitServicesAssembly;
 
         private readonly ConstructorInfo instrumentedAttributeConstructor = typeof(InstrumentedAttribute).GetConstructors().First();
 
@@ -35,10 +36,7 @@ namespace MiniCover.Instrumentation
             this.assemblies = assemblies;
             this.hitsFile = hitsFile;
             this.sourceFiles = sourceFiles;
-            this.instrumentationDependencies = new[]
-            {
-                hitServiceType.Assembly.Location
-            };
+            this.hitServicesAssembly = hitServiceType.Assembly;
             normalizedWorkDir = workdir;
             if (!normalizedWorkDir.EndsWith(Path.DirectorySeparatorChar.ToString()))
                 normalizedWorkDir += Path.DirectorySeparatorChar;
@@ -109,13 +107,10 @@ namespace MiniCover.Instrumentation
                 //Copy instrumentation dependencies
                 var assemblyDirectory = Path.GetDirectoryName(assemblyFile);
 
-                foreach (var dependencyPath in instrumentationDependencies)
-                {
-                    var dependencyAssemblyName = Path.GetFileName(dependencyPath);
-                    var newDependencyPath = Path.Combine(assemblyDirectory, dependencyAssemblyName);
-                    File.Copy(dependencyPath, newDependencyPath, true);
-                    result.AddExtraAssembly(newDependencyPath);
-                }
+                var dependencyAssemblyName = Path.GetFileName(hitServicesAssembly.Location);
+                var newDependencyPath = Path.Combine(assemblyDirectory, dependencyAssemblyName);
+                File.Copy(hitServicesAssembly.Location, newDependencyPath, true);
+                result.AddExtraAssembly(newDependencyPath);
 
                 instrumentedAssembly.AddLocation(
                     Path.GetFullPath(assemblyFile),
@@ -124,9 +119,10 @@ namespace MiniCover.Instrumentation
                     Path.GetFullPath(pdbBackupFile)
                 );
 
+                var hitServicesAssemblyVersion = FileVersionInfo.GetVersionInfo(hitServicesAssembly.Location);
                 foreach (var depsJsonFile in Directory.GetFiles(assemblyDirectory, "*.deps.json"))
                 {
-                    DepsJsonUtils.PatchDepsJson(depsJsonFile);
+                    DepsJsonUtils.PatchDepsJson(depsJsonFile, hitServicesAssemblyVersion.ProductVersion);
                 }
             }
 
